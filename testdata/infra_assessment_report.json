@@ -1,0 +1,23 @@
+{
+  "apiVersion": "aquasecurity.github.io/v1alpha1",
+  "kind": "InfraAssessmentReport",
+  "metadata": {
+    "name": "node-infra",
+    "namespace": "kube-system"
+  },
+  "report": {
+    "scanner": {"name": "Trivy", "vendor": "Aqua Security", "version": "0.50.0"},
+    "summary": {"criticalCount": 0, "highCount": 1, "mediumCount": 0, "lowCount": 0},
+    "checks": [
+      {
+        "checkID": "AVD-KCV-0001",
+        "title": "Audit logs not enabled",
+        "description": "Ensure that the audit log is enabled.",
+        "severity": "HIGH",
+        "messages": ["audit logs are not enabled"],
+        "remediation": "Enable audit logs.",
+        "success": false
+      }
+    ]
+  }
+}

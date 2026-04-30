@@ -1,0 +1,24 @@
+{
+  "apiVersion": "aquasecurity.github.io/v1alpha1",
+  "kind": "ClusterComplianceReport",
+  "metadata": {
+    "name": "nsa"
+  },
+  "spec": {
+    "cron": "0 */6 * * *",
+    "reportType": "summary",
+    "compliance": {
+      "id": "nsa",
+      "title": "National Security Agency - Kubernetes Hardening Guidance",
+      "description": "NSA Kubernetes hardening compliance",
+      "version": "1.0",
+      "relatedResources": [],
+      "platform": "k8s",
+      "type": "kubernetes",
+      "controls": []
+    }
+  },
+  "status": {
+    "summary": {"passCount": 0, "failCount": 0}
+  }
+}
