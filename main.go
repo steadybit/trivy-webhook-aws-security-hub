@@ -384,10 +384,7 @@ func importFindingsToSecurityHub(findings []types.AwsSecurityFinding) error {
 
 	batchSize := 100
 	for i := 0; i < len(findings); i += batchSize {
-		end := i + batchSize
-		if end > len(findings) {
-			end = len(findings)
-		}
+		end := min(i+batchSize, len(findings))
 
 		batch := findings[i:end]
 
