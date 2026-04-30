@@ -1,0 +1,26 @@
+{
+  "apiVersion": "aquasecurity.github.io/v1alpha1",
+  "kind": "ConfigAuditReport",
+  "metadata": {
+    "name": "no-messages-report",
+    "namespace": "default",
+    "ownerReferences": [
+      {"apiVersion": "apps/v1", "kind": "Deployment", "name": "app", "uid": "00000000-0000-0000-0000-000000000003"}
+    ]
+  },
+  "report": {
+    "updateTimestamp": "2026-04-30T10:00:00Z",
+    "scanner": {"name": "Trivy", "vendor": "Aqua Security", "version": "0.50.0"},
+    "summary": {"criticalCount": 0, "highCount": 0, "mediumCount": 0, "lowCount": 0},
+    "checks": [
+      {
+        "checkID": "KSV001",
+        "title": "Check without messages",
+        "description": "desc",
+        "severity": "LOW",
+        "remediation": "fix it",
+        "success": false
+      }
+    ]
+  }
+}

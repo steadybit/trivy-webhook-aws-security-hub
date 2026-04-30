@@ -1,0 +1,27 @@
+{
+  "apiVersion": "aquasecurity.github.io/v1alpha1",
+  "kind": "ConfigAuditReport",
+  "metadata": {
+    "name": "deployment-app",
+    "namespace": "default",
+    "ownerReferences": [
+      {"apiVersion": "apps/v1", "kind": "Deployment", "name": "app", "uid": "00000000-0000-0000-0000-000000000002"}
+    ]
+  },
+  "report": {
+    "updateTimestamp": "2026-04-30T10:00:00Z",
+    "scanner": {"name": "Trivy", "vendor": "Aqua Security", "version": "0.50.0"},
+    "summary": {"criticalCount": 0, "highCount": 0, "mediumCount": 0, "lowCount": 0},
+    "checks": [
+      {
+        "checkID": "KSV-UNKNOWN-001",
+        "title": "Unknown severity check",
+        "description": "Severity should be remapped to INFORMATIONAL.",
+        "severity": "UNKNOWN",
+        "messages": ["Some message"],
+        "remediation": "Investigate the check.",
+        "success": false
+      }
+    ]
+  }
+}
