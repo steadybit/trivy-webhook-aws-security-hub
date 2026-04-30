@@ -11,9 +11,13 @@ go build -o trivy-webhook-aws-security-hub
 # Run locally (listens on :8080, requires AWS credentials in env)
 ./trivy-webhook-aws-security-hub
 
-# Format / vet (no test suite exists)
+# Format / vet
 go fmt ./...
 go vet ./...
+
+# Run tests (HTTP-level, AWS Security Hub + STS faked via internal/testutil)
+go test ./...
+go test -race -coverprofile=coverage.out ./... && go tool cover -func=coverage.out
 
 # Build the multi-arch container image (matches CI)
 docker buildx build --platform linux/amd64,linux/arm64 .
@@ -22,7 +26,7 @@ docker buildx build --platform linux/amd64,linux/arm64 .
 helm template charts/trivy-webhook-aws-security-hub
 ```
 
-There is currently no `go test` suite; CI only builds the binary and the Docker image, and packages the Helm chart on tag pushes (see `.github/workflows/release.yml`).
+CI runs `go test` via `.github/workflows/test.yml`, which gates the Docker build/push in `pre-release.yml` and `release.yml` via `needs: test`.
 
 ## Architecture
 
