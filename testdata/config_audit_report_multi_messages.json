@@ -1,0 +1,30 @@
+{
+  "apiVersion": "aquasecurity.github.io/v1alpha1",
+  "kind": "ConfigAuditReport",
+  "metadata": {
+    "name": "multi-messages-report",
+    "namespace": "default",
+    "ownerReferences": [
+      {"apiVersion": "apps/v1", "kind": "Deployment", "name": "app", "uid": "00000000-0000-0000-0000-000000000004"}
+    ]
+  },
+  "report": {
+    "updateTimestamp": "2026-04-30T10:00:00Z",
+    "scanner": {"name": "Trivy", "vendor": "Aqua Security", "version": "0.50.0"},
+    "summary": {"criticalCount": 0, "highCount": 1, "mediumCount": 0, "lowCount": 0},
+    "checks": [
+      {
+        "checkID": "KSV014",
+        "title": "Root file system is not read-only",
+        "description": "desc",
+        "severity": "HIGH",
+        "messages": [
+          "Container 'app' should set 'readOnlyRootFilesystem' to true",
+          "Container 'sidecar' should set 'readOnlyRootFilesystem' to true"
+        ],
+        "remediation": "fix it",
+        "success": false
+      }
+    ]
+  }
+}

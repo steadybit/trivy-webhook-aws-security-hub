@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
@@ -63,6 +65,26 @@ func truncateDescription(description string) string {
 }
 
 var trivyProductFields = map[string]string{"Product Name": "Trivy"}
+
+// errInvalidReport signals that the incoming report cannot be processed because
+// of missing identifying data. The dispatcher maps this to HTTP 400.
+var errInvalidReport = errors.New("invalid report")
+
+// resolveConfigAuditTarget builds the "<Kind>/<Name>" identifier used as both
+// the finding's Resource.Id and a component of its finding Id. Trivy-operator
+// normally populates ownerReferences, but for orphaned or cluster-scoped
+// reports we fall back to the resource labels it always sets.
+func resolveConfigAuditTarget(report *v1alpha1.ConfigAuditReport) (string, error) {
+	if len(report.OwnerReferences) > 0 {
+		return fmt.Sprintf("%s/%s", report.OwnerReferences[0].Kind, report.OwnerReferences[0].Name), nil
+	}
+	kind := report.Labels["trivy-operator.resource.kind"]
+	name := report.Labels["trivy-operator.resource.name"]
+	if kind != "" && name != "" {
+		return fmt.Sprintf("%s/%s", kind, name), nil
+	}
+	return "", fmt.Errorf("%w: ConfigAuditReport %q has no ownerReferences and no trivy-operator resource labels", errInvalidReport, report.Name)
+}
 
 // Server holds AWS clients and request-independent identity resolved once at startup.
 type Server struct {
@@ -138,6 +160,11 @@ func (s *Server) ProcessTrivyWebhook() http.HandlerFunc {
 			if err == nil {
 				return false
 			}
+			if errors.Is(err, errInvalidReport) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				log.Printf("Invalid report: %v", err)
+				return true
+			}
 			http.Error(w, "Error processing report", http.StatusInternalServerError)
 			log.Printf("Error processing report: %v", err)
 			return true
@@ -204,18 +231,26 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 
 	log.Printf("Processing report: %s", configAuditReport.Name)
 
-	var findings []types.AwsSecurityFinding
+	target, err := resolveConfigAuditTarget(configAuditReport)
+	if err != nil {
+		return nil, err
+	}
 
-	Name := fmt.Sprintf("%s/%s", configAuditReport.OwnerReferences[0].Kind, configAuditReport.OwnerReferences[0].Name)
+	var findings []types.AwsSecurityFinding
 	now := s.now().Format(time.RFC3339)
 
 	for _, check := range configAuditReport.Report.Checks {
 		severity := remapSeverity(check.Severity)
 		description := truncateDescription(check.Description)
 
+		other := map[string]string{}
+		if len(check.Messages) > 0 {
+			other["Message"] = strings.Join(check.Messages, "\n")
+		}
+
 		findings = append(findings, types.AwsSecurityFinding{
 			SchemaVersion: aws.String("2018-10-08"),
-			Id:            aws.String(fmt.Sprintf("%s-%s", check.ID, Name)),
+			Id:            aws.String(fmt.Sprintf("%s-%s", check.ID, target)),
 			ProductArn:    aws.String(s.productArn),
 			GeneratorId:   aws.String(fmt.Sprintf("Trivy/%s", check.ID)),
 			AwsAccountId:  aws.String(s.accountID),
@@ -223,7 +258,7 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 			CreatedAt:     aws.String(now),
 			UpdatedAt:     aws.String(now),
 			Severity:      &types.Severity{Label: types.SeverityLabel(severity)},
-			Title:         aws.String(fmt.Sprintf("Trivy found a misconfiguration in %s: %s", Name, check.Title)),
+			Title:         aws.String(fmt.Sprintf("Trivy found a misconfiguration in %s: %s", target, check.Title)),
 			Description:   aws.String(description),
 			Remediation: &types.Remediation{
 				Recommendation: &types.Recommendation{
@@ -234,13 +269,11 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 			Resources: []types.Resource{
 				{
 					Type:      aws.String("Other"),
-					Id:        aws.String(Name),
+					Id:        aws.String(target),
 					Partition: types.PartitionAws,
 					Region:    aws.String(s.region),
 					Details: &types.ResourceDetails{
-						Other: map[string]string{
-							"Message": check.Messages[0],
-						},
+						Other: other,
 					},
 				},
 			},
