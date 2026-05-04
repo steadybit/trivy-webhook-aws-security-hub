@@ -6,9 +6,12 @@ require (
 	github.com/aquasecurity/trivy-operator v0.30.1
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.17
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.16
 	github.com/aws/aws-sdk-go-v2/service/securityhub v1.69.2
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/gorilla/mux v1.8.1
+	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5
 )
 
@@ -23,7 +26,6 @@ require (
 	github.com/aquasecurity/trivy v0.70.0 // indirect
 	github.com/aquasecurity/trivy-checks v1.12.2-0.20251219190323-79d27547baf5 // indirect
 	github.com/aquasecurity/trivy-db v0.0.0-20260429080452-bd11dd425d21 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.19.16 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
@@ -76,7 +78,6 @@ require (
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/apimachinery v0.36.0 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260427204847-8949caaa1199 // indirect
