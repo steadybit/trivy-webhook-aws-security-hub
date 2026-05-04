@@ -9,18 +9,28 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/securityhub"
 	"github.com/aws/aws-sdk-go-v2/service/securityhub/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/csepulveda/trivy-webhook-aws-security-hub/internal/ignore"
 	"github.com/csepulveda/trivy-webhook-aws-security-hub/tools"
 	"github.com/gorilla/mux"
 )
+
+// trivyIgnoreRuleIDKey is the ProductFields marker that identifies findings
+// suppressed by the trivy-ignore feature. The reconciler uses it to scope
+// un-suppression to findings *we* suppressed, leaving operator-driven
+// console suppressions untouched.
+const trivyIgnoreRuleIDKey = "TrivyIgnoreRuleId"
 
 type webhook struct {
 	Kind       string `json:"kind"`
@@ -47,6 +57,8 @@ type Config struct {
 	ConfigAuditEnable       bool
 	ClusterComplianceEnable bool
 	VulnerabilityEnable     bool
+	IgnoreFile              string
+	ReconcileInterval       time.Duration
 }
 
 func LoadConfig() Config {
@@ -55,6 +67,8 @@ func LoadConfig() Config {
 		ConfigAuditEnable:       tools.ParseEnvBool("CONFIG_AUDIT_ENABLE", true),
 		ClusterComplianceEnable: tools.ParseEnvBool("CLUSTER_COMPLIANCE_ENABLE", true),
 		VulnerabilityEnable:     tools.ParseEnvBool("VULNERABILITY_ENABLE", true),
+		IgnoreFile:              os.Getenv("TRIVY_IGNORE_FILE"),
+		ReconcileInterval:       tools.ParseEnvDuration("IGNORE_RECONCILE_INTERVAL", 24*time.Hour),
 	}
 }
 
@@ -102,29 +116,55 @@ func resolveConfigAuditTarget(report *v1alpha1.ConfigAuditReport) (string, error
 
 // Server holds AWS clients and request-independent identity resolved once at startup.
 type Server struct {
-	cfg         Config
-	securityHub *securityhub.Client
-	accountID   string
-	region      string
-	productArn  string
-	now         func() time.Time
+	cfg                   Config
+	securityHub           *securityhub.Client
+	reconcilerSecurityHub *securityhub.Client
+	accountID             string
+	region                string
+	productArn            string
+	now                   func() time.Time
+	ignorePath            string
+	ignore                *ignore.IgnoreConfig
 }
 
-// NewServer resolves the caller identity via STS and constructs the Security Hub client.
-func NewServer(ctx context.Context, awsCfg aws.Config, cfg Config) (*Server, error) {
+// NewServer resolves the caller identity via STS and constructs the Security Hub clients.
+// A second SecurityHub client is built for the reconciler with adaptive
+// rate-limiting and a higher retry budget — that's a background job with no
+// latency budget, unlike the request path. If now is nil it defaults to
+// time.Now; tests inject a fixed clock for deterministic expiry pruning.
+func NewServer(ctx context.Context, awsCfg aws.Config, cfg Config, now func() time.Time) (*Server, error) {
+	if now == nil {
+		now = time.Now
+	}
 	stsClient := sts.NewFromConfig(awsCfg)
 	callerIdentity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get caller identity: %w", err)
 	}
 	region := awsCfg.Region
+	ignoreCfg, err := ignore.LoadIgnoreFile(cfg.IgnoreFile, now())
+	if err != nil {
+		return nil, fmt.Errorf("loading ignore file: %w", err)
+	}
+	if cfg.IgnoreFile != "" {
+		log.Printf("Loaded %d active rule(s) from %s", len(ignoreCfg.Vulnerabilities), cfg.IgnoreFile)
+	}
 	return &Server{
 		cfg:         cfg,
 		securityHub: securityhub.NewFromConfig(awsCfg),
-		accountID:   aws.ToString(callerIdentity.Account),
-		region:      region,
-		productArn:  fmt.Sprintf("arn:aws:securityhub:%s::product/aquasecurity/aquasecurity", region),
-		now:         time.Now,
+		reconcilerSecurityHub: securityhub.NewFromConfig(awsCfg, func(o *securityhub.Options) {
+			o.Retryer = retry.NewAdaptiveMode(func(ao *retry.AdaptiveModeOptions) {
+				ao.StandardOptions = append(ao.StandardOptions, func(so *retry.StandardOptions) {
+					so.MaxAttempts = 10
+				})
+			})
+		}),
+		accountID:  aws.ToString(callerIdentity.Account),
+		region:     region,
+		productArn: fmt.Sprintf("arn:aws:securityhub:%s::product/aquasecurity/aquasecurity", region),
+		now:        now,
+		ignorePath: cfg.IgnoreFile,
+		ignore:     ignoreCfg,
 	}, nil
 }
 
@@ -393,6 +433,19 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 		}
 		description = truncateDescription(description)
 
+		productFields := map[string]string{"Product Name": "Trivy"}
+		var workflow *types.Workflow
+		var note *types.Note
+		if match := s.ignore.MatchVulnerability(vulnerabilities.VulnerabilityID, vulnerabilities.Target, vulnerabilities.PkgPath); match != nil {
+			workflow = &types.Workflow{Status: types.WorkflowStatusSuppressed}
+			note = &types.Note{
+				Text:      aws.String(buildSuppressionNote(match)),
+				UpdatedBy: aws.String("trivy-webhook"),
+				UpdatedAt: aws.String(now),
+			}
+			productFields[trivyIgnoreRuleIDKey] = match.ID
+		}
+
 		findings = append(findings, types.AwsSecurityFinding{
 			SchemaVersion: aws.String("2018-10-08"),
 			Id:            aws.String(fmt.Sprintf("%s-%s", FullImageName, vulnerabilities.VulnerabilityID)),
@@ -411,7 +464,7 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 					Url:  aws.String(vulnerabilities.PrimaryLink),
 				},
 			},
-			ProductFields: trivyProductFields,
+			ProductFields: productFields,
 			Resources: []types.Resource{
 				{
 					Type:      aws.String("Container"),
@@ -428,15 +481,37 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 							"Patched Package":   vulnerabilities.FixedVersion,
 							"NvdCvssScoreV3":    fmt.Sprintf("%f", tools.GetVulnScore(vulnerabilities)),
 							"NvdCvssVectorV3":   "",
+							"Vuln Target":       vulnerabilities.Target,
+							"Pkg Path":          vulnerabilities.PkgPath,
 						},
 					},
 				},
 			},
 			RecordState: types.RecordStateActive,
+			Workflow:    workflow,
+			Note:        note,
 		})
 	}
 
 	return findings, nil
+}
+
+// buildSuppressionNote renders the trivy ignore rule into a human-readable
+// note for the Security Hub finding. Capped at 512 chars (Security Hub limit).
+func buildSuppressionNote(rule *ignore.IgnoreFinding) string {
+	stmt := rule.Statement
+	if stmt == "" {
+		stmt = "(no statement)"
+	}
+	expires := "never"
+	if !rule.ExpiredAt.IsZero() {
+		expires = rule.ExpiredAt.Format(time.RFC3339)
+	}
+	text := fmt.Sprintf("Suppressed by trivy ignore rule %s. Statement: %s. Expires: %s", rule.ID, stmt, expires)
+	if len(text) > 512 {
+		text = text[:509] + "..."
+	}
+	return text
 }
 
 // Import findings to AWS Security Hub in batches of 100
@@ -477,12 +552,32 @@ func main() {
 		log.Fatalf("unable to load AWS SDK config: %v", err)
 	}
 
-	srv, err := NewServer(startupCtx, awsCfg, cfg)
+	srv, err := NewServer(startupCtx, awsCfg, cfg, time.Now)
 	if err != nil {
 		log.Fatalf("unable to create server: %v", err)
 	}
 
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if cfg.IgnoreFile != "" && cfg.ReconcileInterval > 0 {
+		go srv.runReconciler(rootCtx)
+	} else if cfg.IgnoreFile != "" {
+		log.Printf("Ignore file configured but reconciler disabled (IGNORE_RECONCILE_INTERVAL=0); stale suppressions will not be lifted automatically")
+	}
+
 	port := ":8080"
 	log.Printf("Starting server on port %s", port)
-	log.Fatal(http.ListenAndServe(port, srv.Routes()))
+	httpSrv := &http.Server{Addr: port, Handler: srv.Routes()}
+	go func() {
+		<-rootCtx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP shutdown: %v", err)
+		}
+	}()
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }
