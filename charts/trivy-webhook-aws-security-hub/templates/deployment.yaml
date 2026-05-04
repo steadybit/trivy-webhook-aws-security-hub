@@ -47,6 +47,10 @@ spec:
               value: {{ .Values.config.CLUSTER_COMPLIANCE_ENABLE | quote }}
             - name: VULNERABILITY_ENABLE
               value: {{ .Values.config.VULNERABILITY_ENABLE | quote }}
+            - name: TRIVY_IGNORE_FILE
+              value: {{ .Values.config.TRIVY_IGNORE_FILE | quote }}
+            - name: IGNORE_RECONCILE_INTERVAL
+              value: {{ .Values.config.IGNORE_RECONCILE_INTERVAL | quote }}
             {{ if .Values.extraenvs }}
               {{- toYaml .Values.extraenvs | nindent 12 }}
             {{- end }}
