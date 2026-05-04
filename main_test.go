@@ -421,46 +421,64 @@ func TestConfigAudit_UnknownSeverityRemaps(t *testing.T) {
 	}
 }
 
-// Pins a known bug: getConfigAuditReportFindings indexes OwnerReferences[0]
-// unchecked. When fixed, replace with a 4xx assertion.
-func TestConfigAudit_EmptyOwnerReferences_PanicsAsKnownBug(t *testing.T) {
-	srv, _ := newTestServer(t, defaultCfg())
-	body := loadFixture(t, "config_audit_report_no_owner.json")
-	req := httptest.NewRequest(http.MethodPost, "/trivy-webhook", bytes.NewReader(body))
-	rr := httptest.NewRecorder()
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic from OwnerReferences[0] indexing; if this is now safe, replace with a 4xx assertion")
-		}
-		if !strings.Contains(fmt.Sprintf("%v", r), "index out of range") {
-			t.Errorf("unexpected panic value: %v", r)
-		}
-	}()
-
-	srv.Routes().ServeHTTP(rr, req)
+func TestConfigAudit_NoOwnerNoLabels_Returns400(t *testing.T) {
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postFixture(t, srv, "config_audit_report_no_owner.json")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%q", rr.Code, rr.Body.String())
+	}
+	if n := len(fake.BatchImports()); n != 0 {
+		t.Errorf("BatchImports calls = %d, want 0", n)
+	}
 }
 
-// Pins a known bug: getConfigAuditReportFindings indexes check.Messages[0]
-// unchecked. When fixed, replace with a 4xx assertion.
-func TestConfigAudit_EmptyMessages_PanicsAsKnownBug(t *testing.T) {
-	srv, _ := newTestServer(t, defaultCfg())
-	body := loadFixture(t, "config_audit_report_no_messages.json")
-	req := httptest.NewRequest(http.MethodPost, "/trivy-webhook", bytes.NewReader(body))
-	rr := httptest.NewRecorder()
+func TestConfigAudit_NoOwnerWithLabels_UsesLabels(t *testing.T) {
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postFixture(t, srv, "config_audit_report_no_owner_with_labels.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	findings := allFindings(fake.BatchImports())
+	if len(findings) != 1 {
+		t.Fatalf("findings = %d, want 1", len(findings))
+	}
+	if got := aws.ToString(findings[0].Resources[0].Id); got != "ReplicaSet/nginx-6d4cf56db6" {
+		t.Errorf("Resource.Id = %q, want ReplicaSet/nginx-6d4cf56db6", got)
+	}
+	if got := aws.ToString(findings[0].Id); got != "KSV001-ReplicaSet/nginx-6d4cf56db6" {
+		t.Errorf("Id = %q", got)
+	}
+}
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic from Messages[0] indexing; if this is now safe, replace with a 4xx assertion")
-		}
-		if !strings.Contains(fmt.Sprintf("%v", r), "index out of range") {
-			t.Errorf("unexpected panic value: %v", r)
-		}
-	}()
+func TestConfigAudit_EmptyMessages_EmitsFindingWithoutMessage(t *testing.T) {
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postFixture(t, srv, "config_audit_report_no_messages.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	findings := allFindings(fake.BatchImports())
+	if len(findings) != 1 {
+		t.Fatalf("findings = %d, want 1", len(findings))
+	}
+	if _, present := findings[0].Resources[0].Details.Other["Message"]; present {
+		t.Errorf("Message key should be absent when check has no messages, got %+v", findings[0].Resources[0].Details.Other)
+	}
+}
 
-	srv.Routes().ServeHTTP(rr, req)
+func TestConfigAudit_MultipleMessages_JoinsMessages(t *testing.T) {
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postFixture(t, srv, "config_audit_report_multi_messages.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	findings := allFindings(fake.BatchImports())
+	if len(findings) != 1 {
+		t.Fatalf("findings = %d, want 1", len(findings))
+	}
+	want := "Container 'app' should set 'readOnlyRootFilesystem' to true\nContainer 'sidecar' should set 'readOnlyRootFilesystem' to true"
+	if got := findings[0].Resources[0].Details.Other["Message"]; got != want {
+		t.Errorf("Message = %q, want %q", got, want)
+	}
 }
 
 // ---- Stubs ----

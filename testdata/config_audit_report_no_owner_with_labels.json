@@ -1,0 +1,29 @@
+{
+  "apiVersion": "aquasecurity.github.io/v1alpha1",
+  "kind": "ConfigAuditReport",
+  "metadata": {
+    "name": "orphan-with-labels-report",
+    "namespace": "default",
+    "labels": {
+      "trivy-operator.resource.kind": "ReplicaSet",
+      "trivy-operator.resource.name": "nginx-6d4cf56db6",
+      "trivy-operator.resource.namespace": "default"
+    }
+  },
+  "report": {
+    "updateTimestamp": "2026-04-30T10:00:00Z",
+    "scanner": {"name": "Trivy", "vendor": "Aqua Security", "version": "0.50.0"},
+    "summary": {"criticalCount": 0, "highCount": 0, "mediumCount": 1, "lowCount": 0},
+    "checks": [
+      {
+        "checkID": "KSV001",
+        "title": "Process can elevate its own privileges",
+        "description": "desc",
+        "severity": "MEDIUM",
+        "messages": ["Container 'nginx' should set 'allowPrivilegeEscalation' to false"],
+        "remediation": "fix it",
+        "success": false
+      }
+    ]
+  }
+}
