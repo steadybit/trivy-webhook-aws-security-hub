@@ -10,7 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -636,7 +636,7 @@ func TestProcessTrivyWebhook_DeleteEnvelope_VulnerabilityReport(t *testing.T) {
 	unwrapped := runFixture(t, raw)
 	deleted := runFixture(t, envelope(t, "delete", raw))
 
-	if got, want := findingIDs(deleted), findingIDs(unwrapped); !reflect.DeepEqual(got, want) {
+	if got, want := findingIDs(deleted), findingIDs(unwrapped); !slices.Equal(got, want) {
 		t.Errorf("delete-envelope Ids = %v, want %v (must match unwrapped path)", got, want)
 	}
 	for i, f := range deleted {
@@ -651,7 +651,7 @@ func TestProcessTrivyWebhook_DeleteEnvelope_ConfigAuditReport(t *testing.T) {
 	unwrapped := runFixture(t, raw)
 	deleted := runFixture(t, envelope(t, "delete", raw))
 
-	if got, want := findingIDs(deleted), findingIDs(unwrapped); !reflect.DeepEqual(got, want) {
+	if got, want := findingIDs(deleted), findingIDs(unwrapped); !slices.Equal(got, want) {
 		t.Errorf("delete-envelope Ids = %v, want %v (must match unwrapped path)", got, want)
 	}
 	for i, f := range deleted {
@@ -666,7 +666,7 @@ func TestProcessTrivyWebhook_UpdateEnvelope(t *testing.T) {
 	unwrapped := runFixture(t, raw)
 	updated := runFixture(t, envelope(t, "update", raw))
 
-	if got, want := findingIDs(updated), findingIDs(unwrapped); !reflect.DeepEqual(got, want) {
+	if got, want := findingIDs(updated), findingIDs(unwrapped); !slices.Equal(got, want) {
 		t.Errorf("update-envelope Ids = %v, want %v", got, want)
 	}
 	for i, f := range updated {

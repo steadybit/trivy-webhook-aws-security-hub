@@ -27,11 +27,11 @@ type webhook struct {
 	APIVersion string `json:"apiVersion"`
 }
 
-// WebhookMsg is the envelope trivy-operator sends when
+// webhookMsg is the envelope trivy-operator sends when
 // OPERATOR_SEND_DELETED_REPORTS=true. Verb is "update" for create/update
 // events and "delete" when the underlying CRD is removed. Without the
 // envelope, raw report bodies are POSTed instead.
-type WebhookMsg struct {
+type webhookMsg struct {
 	Verb           string          `json:"verb"`
 	OperatorObject json.RawMessage `json:"operatorObject"`
 }
@@ -164,7 +164,7 @@ func (s *Server) ProcessTrivyWebhook() http.HandlerFunc {
 		}
 
 		verb := verbUpdate
-		var envelope WebhookMsg
+		var envelope webhookMsg
 		if err := json.Unmarshal(body, &envelope); err == nil && envelope.Verb != "" && len(envelope.OperatorObject) > 0 {
 			verb = envelope.Verb
 			body = envelope.OperatorObject
@@ -173,7 +173,7 @@ func (s *Server) ProcessTrivyWebhook() http.HandlerFunc {
 		if verb != verbUpdate && verb != verbDelete {
 			log.Printf("Ignoring webhook with unknown verb %q", verb)
 			w.WriteHeader(http.StatusOK)
-			if _, err := w.Write([]byte("Report processed")); err != nil {
+			if _, err := w.Write([]byte("Ignored unknown verb")); err != nil {
 				log.Printf("Error writing response: %v", err)
 			}
 			return
