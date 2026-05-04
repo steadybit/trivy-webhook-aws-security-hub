@@ -2,7 +2,7 @@ FROM golang:1.26-alpine3.22 AS builder
 ARG TARGETOS TARGETARCH TARGETVARIANT
 WORKDIR /app
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH  go build -ldflags "-s -w" -o main main.go
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH  go build -ldflags "-s -w" -o main .
 
 FROM alpine:3.22
 RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 openssl && apk --no-cache add ca-certificates
