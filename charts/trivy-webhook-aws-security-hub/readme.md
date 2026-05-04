@@ -156,6 +156,16 @@ Example:
 
 This ensures that the Trivy Operator sends its scan results to the Trivy webhook, which will then process and forward them to AWS Security Hub.
 
+### Archive findings on report deletion
+
+By default, when the Trivy Operator removes a report (the underlying workload is gone or the vulnerability has been patched), the corresponding finding stays `ACTIVE` in AWS Security Hub. To have those findings transition to `ARCHIVED` automatically, enable deletion notifications on the Trivy Operator:
+
+```bash
+--set operator.webhookSendDeletedReports=true
+```
+
+The webhook then re-imports the same finding Ids with `RecordState=ARCHIVED`. Create/update events continue to import as `ACTIVE`.
+
 ## How It Works
 
 1. **Trivy Scan**: Trivy scans container images for vulnerabilities.

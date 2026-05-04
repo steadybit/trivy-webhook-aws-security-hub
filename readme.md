@@ -18,6 +18,10 @@ This application processes vulnerability reports from **Trivy**, a vulnerability
 3. **AWS Security Hub Integration**: Vulnerabilities and other security findings are imported into AWS Security Hub.
 4. **Health Check**: The `/healthz` endpoint provides a simple health check for the application.
 
+## Deletion handling
+
+The webhook accepts both raw report bodies and the `{"verb":"update|delete","operatorObject":{...}}` envelope that trivy-operator sends when `OPERATOR_SEND_DELETED_REPORTS=true`. Setting that flag on the Trivy Operator makes deleted reports transition the corresponding Security Hub findings to `RecordState=ARCHIVED` (re-imported with the same finding Id). Without the flag, deletions are not propagated and findings stay `ACTIVE` indefinitely.
+
 ## Prerequisites
 
 - **AWS Account**: This application uses AWS Security Hub to store and manage security findings, so you must have an active AWS account and the necessary permissions.

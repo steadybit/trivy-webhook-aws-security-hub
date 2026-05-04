@@ -27,6 +27,20 @@ type webhook struct {
 	APIVersion string `json:"apiVersion"`
 }
 
+// webhookMsg is the envelope trivy-operator sends when
+// OPERATOR_SEND_DELETED_REPORTS=true. Verb is "update" for create/update
+// events and "delete" when the underlying CRD is removed. Without the
+// envelope, raw report bodies are POSTed instead.
+type webhookMsg struct {
+	Verb           string          `json:"verb"`
+	OperatorObject json.RawMessage `json:"operatorObject"`
+}
+
+const (
+	verbUpdate = "update"
+	verbDelete = "delete"
+)
+
 // Config holds feature flags
 type Config struct {
 	InfraAssessmentEnable   bool
@@ -149,6 +163,22 @@ func (s *Server) ProcessTrivyWebhook() http.HandlerFunc {
 			return
 		}
 
+		verb := verbUpdate
+		var envelope webhookMsg
+		if err := json.Unmarshal(body, &envelope); err == nil && envelope.Verb != "" && len(envelope.OperatorObject) > 0 {
+			verb = envelope.Verb
+			body = envelope.OperatorObject
+		}
+
+		if verb != verbUpdate && verb != verbDelete {
+			log.Printf("Ignoring webhook with unknown verb %q", verb)
+			w.WriteHeader(http.StatusOK)
+			if _, err := w.Write([]byte("Ignored unknown verb")); err != nil {
+				log.Printf("Error writing response: %v", err)
+			}
+			return
+		}
+
 		err = json.Unmarshal(body, &report)
 		if err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -206,6 +236,12 @@ func (s *Server) ProcessTrivyWebhook() http.HandlerFunc {
 			return
 		}
 
+		if verb == verbDelete {
+			for i := range findings {
+				findings[i].RecordState = types.RecordStateArchived
+			}
+		}
+
 		err = s.importFindingsToSecurityHub(r.Context(), findings)
 		if err != nil {
 			http.Error(w, "Error importing findings to Security Hub", http.StatusInternalServerError)
@@ -214,7 +250,7 @@ func (s *Server) ProcessTrivyWebhook() http.HandlerFunc {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		_, err = w.Write([]byte("Vulnerabilities processed and imported to Security Hub"))
+		_, err = w.Write([]byte("Report processed"))
 		if err != nil {
 			log.Printf("Error writing response: %v", err)
 		}

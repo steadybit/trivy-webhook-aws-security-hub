@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -595,6 +596,106 @@ func TestSecurityHub_SecondBatchFails_FirstAlreadyImported(t *testing.T) {
 		if len(imports[i].Findings) != 50 {
 			t.Errorf("batch[%d] size = %d, want 50 (second batch retries with same payload)", i, len(imports[i].Findings))
 		}
+	}
+}
+
+// ---- WebhookMsg envelope (OPERATOR_SEND_DELETED_REPORTS=true) ----
+
+func envelope(t *testing.T, verb string, operatorObject []byte) []byte {
+	t.Helper()
+	out, err := json.Marshal(struct {
+		Verb           string          `json:"verb"`
+		OperatorObject json.RawMessage `json:"operatorObject"`
+	}{Verb: verb, OperatorObject: operatorObject})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return out
+}
+
+func findingIDs(findings []types.AwsSecurityFinding) []string {
+	ids := make([]string, len(findings))
+	for i, f := range findings {
+		ids[i] = aws.ToString(f.Id)
+	}
+	return ids
+}
+
+func runFixture(t *testing.T, body []byte) []types.AwsSecurityFinding {
+	t.Helper()
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postWebhook(t, srv, body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	return allFindings(fake.BatchImports())
+}
+
+func TestProcessTrivyWebhook_DeleteEnvelope_VulnerabilityReport(t *testing.T) {
+	raw := loadFixture(t, "vulnerability_report_basic.json")
+	unwrapped := runFixture(t, raw)
+	deleted := runFixture(t, envelope(t, "delete", raw))
+
+	if got, want := findingIDs(deleted), findingIDs(unwrapped); !slices.Equal(got, want) {
+		t.Errorf("delete-envelope Ids = %v, want %v (must match unwrapped path)", got, want)
+	}
+	for i, f := range deleted {
+		if f.RecordState != types.RecordStateArchived {
+			t.Errorf("RecordState[%d] = %v, want ARCHIVED", i, f.RecordState)
+		}
+	}
+}
+
+func TestProcessTrivyWebhook_DeleteEnvelope_ConfigAuditReport(t *testing.T) {
+	raw := loadFixture(t, "config_audit_report_basic.json")
+	unwrapped := runFixture(t, raw)
+	deleted := runFixture(t, envelope(t, "delete", raw))
+
+	if got, want := findingIDs(deleted), findingIDs(unwrapped); !slices.Equal(got, want) {
+		t.Errorf("delete-envelope Ids = %v, want %v (must match unwrapped path)", got, want)
+	}
+	for i, f := range deleted {
+		if f.RecordState != types.RecordStateArchived {
+			t.Errorf("RecordState[%d] = %v, want ARCHIVED", i, f.RecordState)
+		}
+	}
+}
+
+func TestProcessTrivyWebhook_UpdateEnvelope(t *testing.T) {
+	raw := loadFixture(t, "vulnerability_report_basic.json")
+	unwrapped := runFixture(t, raw)
+	updated := runFixture(t, envelope(t, "update", raw))
+
+	if got, want := findingIDs(updated), findingIDs(unwrapped); !slices.Equal(got, want) {
+		t.Errorf("update-envelope Ids = %v, want %v", got, want)
+	}
+	for i, f := range updated {
+		if f.RecordState != types.RecordStateActive {
+			t.Errorf("RecordState[%d] = %v, want ACTIVE", i, f.RecordState)
+		}
+	}
+}
+
+func TestProcessTrivyWebhook_UnwrappedStillWorks(t *testing.T) {
+	findings := runFixture(t, loadFixture(t, "vulnerability_report_basic.json"))
+	if len(findings) == 0 {
+		t.Fatal("expected findings from unwrapped report")
+	}
+	for i, f := range findings {
+		if f.RecordState != types.RecordStateActive {
+			t.Errorf("RecordState[%d] = %v, want ACTIVE (regression: unwrapped path must still import)", i, f.RecordState)
+		}
+	}
+}
+
+func TestProcessTrivyWebhook_UnknownVerb(t *testing.T) {
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postWebhook(t, srv, envelope(t, "weird", loadFixture(t, "vulnerability_report_basic.json")))
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	if n := len(fake.BatchImports()); n != 0 {
+		t.Errorf("BatchImports calls = %d, want 0 (unknown verb must not import)", n)
 	}
 }
 

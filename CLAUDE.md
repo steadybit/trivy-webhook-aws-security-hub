@@ -33,10 +33,10 @@ CI runs `go test` via `.github/workflows/test.yml`, which gates the Docker build
 This is a single-process HTTP webhook receiver that translates trivy-operator CRD reports into AWS Security Hub findings. The full request flow lives in `main.go`; `tools/main.go` only holds two small helpers (`GetVulnScore`, `ParseEnvBool`).
 
 **Request flow** (`ProcessTrivyWebhook` in `main.go`):
-1. Trivy-operator POSTs a CRD object as JSON to `/trivy-webhook`.
-2. The body is first decoded into a stub `webhook{Kind, APIVersion}` to dispatch on `kind`.
+1. Trivy-operator POSTs a CRD object as JSON to `/trivy-webhook`. Two body shapes are accepted: raw report bodies, or the `WebhookMsg` envelope `{"verb":"update|delete","operatorObject":{...}}` that trivy-operator emits when `OPERATOR_SEND_DELETED_REPORTS=true`. Verb defaults to `update` when no envelope is present; unknown verbs return 200 OK with no work done (forward-compatible no-op).
+2. The (possibly unwrapped) body is first decoded into a stub `webhook{Kind, APIVersion}` to dispatch on `kind`.
 3. A second decode into the matching `v1alpha1.*Report` struct (from `github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1`) extracts the data.
-4. A per-kind builder converts the report into `[]types.AwsSecurityFinding`.
+4. A per-kind builder converts the report into `[]types.AwsSecurityFinding` with `RecordState=ACTIVE`. If `verb=="delete"`, the dispatcher rewrites every finding's `RecordState` to `ARCHIVED` before import — that's the **only** difference between import and archive. Re-importing the same finding Id with `ARCHIVED` is the canonical ASFF archival pattern (`BatchUpdateFindings` does not accept `RecordState`).
 5. `importFindingsToSecurityHub` chunks findings into batches of 100 (the BatchImportFindings limit) and calls AWS Security Hub.
 
 **Supported report kinds** (each can be toggled via env var):
