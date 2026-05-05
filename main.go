@@ -26,11 +26,19 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// trivyIgnoreRuleIDKey is the ProductFields marker that identifies findings
-// suppressed by the trivy-ignore feature. The reconciler uses it to scope
-// un-suppression to findings *we* suppressed, leaving operator-driven
-// console suppressions untouched.
-const trivyIgnoreRuleIDKey = "TrivyIgnoreRuleId"
+// Finding-shape constants. The reconciler reads back what the import path
+// wrote, so the keys must agree on both sides — defining them once prevents
+// drift. trivyIgnoreRuleIDKey is the ProductFields marker that scopes the
+// reconciler to findings *we* suppressed (not operator-driven console ones).
+const (
+	productNameKey       = "Product Name"
+	trivyProductName     = "Trivy"
+	trivyIgnoreRuleIDKey = "TrivyIgnoreRuleId"
+	trivyWebhookUpdater  = "trivy-webhook"
+	cveIDKey             = "CVE ID"
+	vulnTargetKey        = "Vuln Target"
+	pkgPathKey           = "Pkg Path"
+)
 
 type webhook struct {
 	Kind       string `json:"kind"`
@@ -84,15 +92,15 @@ func remapSeverity(severity v1alpha1.Severity) string {
 	return string(severity)
 }
 
-// Security Hub caps Description at 1024 chars.
-func truncateDescription(description string) string {
-	if len(description) > 1024 {
-		return description[:1021] + "..."
+// truncate caps a string at max chars, replacing the tail with "..." when
+// it overflows. Used for Security Hub's per-field length limits (Description
+// is 1024, Note.Text is 512).
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	return description
+	return s[:max-3] + "..."
 }
-
-var trivyProductFields = map[string]string{"Product Name": "Trivy"}
 
 // errInvalidReport signals that the incoming report cannot be processed because
 // of missing identifying data. The dispatcher maps this to HTTP 400.
@@ -123,7 +131,6 @@ type Server struct {
 	region                string
 	productArn            string
 	now                   func() time.Time
-	ignorePath            string
 	ignore                *ignore.IgnoreConfig
 }
 
@@ -163,7 +170,6 @@ func NewServer(ctx context.Context, awsCfg aws.Config, cfg Config, now func() ti
 		region:     region,
 		productArn: fmt.Sprintf("arn:aws:securityhub:%s::product/aquasecurity/aquasecurity", region),
 		now:        now,
-		ignorePath: cfg.IgnoreFile,
 		ignore:     ignoreCfg,
 	}, nil
 }
@@ -317,7 +323,7 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 
 	for _, check := range configAuditReport.Report.Checks {
 		severity := remapSeverity(check.Severity)
-		description := truncateDescription(check.Description)
+		description := truncate(check.Description, 1024)
 
 		other := map[string]string{}
 		if len(check.Messages) > 0 {
@@ -341,7 +347,7 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 					Text: aws.String(check.Remediation),
 				},
 			},
-			ProductFields: trivyProductFields,
+			ProductFields: map[string]string{productNameKey: trivyProductName},
 			Resources: []types.Resource{
 				{
 					Type:      aws.String("Other"),
@@ -431,16 +437,16 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 		if description == "" {
 			description = vulnerabilities.Title
 		}
-		description = truncateDescription(description)
+		description = truncate(description, 1024)
 
-		productFields := map[string]string{"Product Name": "Trivy"}
+		productFields := map[string]string{productNameKey: trivyProductName}
 		var workflow *types.Workflow
 		var note *types.Note
 		if match := s.ignore.MatchVulnerability(vulnerabilities.VulnerabilityID, vulnerabilities.Target, vulnerabilities.PkgPath); match != nil {
 			workflow = &types.Workflow{Status: types.WorkflowStatusSuppressed}
 			note = &types.Note{
 				Text:      aws.String(buildSuppressionNote(match)),
-				UpdatedBy: aws.String("trivy-webhook"),
+				UpdatedBy: aws.String(trivyWebhookUpdater),
 				UpdatedAt: aws.String(now),
 			}
 			productFields[trivyIgnoreRuleIDKey] = match.ID
@@ -474,15 +480,15 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 					Details: &types.ResourceDetails{
 						Other: map[string]string{
 							"Container Image":   ImageName,
-							"CVE ID":            vulnerabilities.VulnerabilityID,
+							cveIDKey:            vulnerabilities.VulnerabilityID,
 							"CVE Title":         vulnerabilities.Title,
 							"PkgName":           vulnerabilities.Resource,
 							"Installed Package": vulnerabilities.InstalledVersion,
 							"Patched Package":   vulnerabilities.FixedVersion,
 							"NvdCvssScoreV3":    fmt.Sprintf("%f", tools.GetVulnScore(vulnerabilities)),
 							"NvdCvssVectorV3":   "",
-							"Vuln Target":       vulnerabilities.Target,
-							"Pkg Path":          vulnerabilities.PkgPath,
+							vulnTargetKey:       vulnerabilities.Target,
+							pkgPathKey:          vulnerabilities.PkgPath,
 						},
 					},
 				},
@@ -507,11 +513,7 @@ func buildSuppressionNote(rule *ignore.IgnoreFinding) string {
 	if !rule.ExpiredAt.IsZero() {
 		expires = rule.ExpiredAt.Format(time.RFC3339)
 	}
-	text := fmt.Sprintf("Suppressed by trivy ignore rule %s. Statement: %s. Expires: %s", rule.ID, stmt, expires)
-	if len(text) > 512 {
-		text = text[:509] + "..."
-	}
-	return text
+	return truncate(fmt.Sprintf("Suppressed by trivy ignore rule %s. Statement: %s. Expires: %s", rule.ID, stmt, expires), 512)
 }
 
 // Import findings to AWS Security Hub in batches of 100
