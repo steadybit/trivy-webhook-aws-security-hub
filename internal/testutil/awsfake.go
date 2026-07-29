@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/securityhub"
+	"github.com/aws/aws-sdk-go-v2/service/securityhub/types"
 )
 
 // AWSError configures an error response from the fake.
@@ -35,6 +36,8 @@ type FakeAWS struct {
 
 	mu           sync.Mutex
 	batchImports []securityhub.BatchImportFindingsInput
+	batchUpdates []securityhub.BatchUpdateFindingsInput
+	getFindings  []securityhub.GetFindingsInput
 
 	Account string
 	Region  string
@@ -47,6 +50,19 @@ type FakeAWS struct {
 	// only the first call failed, retries would silently succeed.
 	SecurityHubErrorOnCall int
 	SecurityHubError       *AWSError
+
+	// GetFindingsResults is returned (in one page, with NextToken=nil) by the
+	// next GetFindings call. Tests seed this to drive the reconciler.
+	GetFindingsResults []types.AwsSecurityFinding
+
+	// GetFindingsError, if set, makes every GetFindings call return that
+	// error instead of GetFindingsResults. Used to exercise the reconciler's
+	// log-and-continue policy.
+	GetFindingsError *AWSError
+
+	// BatchUpdateError, if set, makes every BatchUpdateFindings call return
+	// that error.
+	BatchUpdateError *AWSError
 }
 
 func NewFakeAWS(t *testing.T) *FakeAWS {
@@ -84,10 +100,34 @@ func (f *FakeAWS) BatchImports() []securityhub.BatchImportFindingsInput {
 	return out
 }
 
+// BatchUpdates returns a snapshot of every BatchUpdateFindings input received.
+func (f *FakeAWS) BatchUpdates() []securityhub.BatchUpdateFindingsInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]securityhub.BatchUpdateFindingsInput, len(f.batchUpdates))
+	copy(out, f.batchUpdates)
+	return out
+}
+
+// GetFindingsCalls returns a snapshot of every GetFindings input received.
+func (f *FakeAWS) GetFindingsCalls() []securityhub.GetFindingsInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]securityhub.GetFindingsInput, len(f.getFindings))
+	copy(out, f.getFindings)
+	return out
+}
+
 func (f *FakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/findings/import":
-		f.serveSecurityHub(w, r)
+		f.serveBatchImport(w, r)
+		return
+	case "/findings/batchupdate":
+		f.serveBatchUpdate(w, r)
+		return
+	case "/findings":
+		f.serveGetFindings(w, r)
 		return
 	case "/", "":
 		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
@@ -100,7 +140,7 @@ func (f *FakeAWS) serve(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "unrecognized AWS request", http.StatusBadRequest)
 }
 
-func (f *FakeAWS) serveSecurityHub(w http.ResponseWriter, r *http.Request) {
+func (f *FakeAWS) serveBatchImport(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		f.t.Errorf("FakeAWS: read body: %v", err)
@@ -128,6 +168,72 @@ func (f *FakeAWS) serveSecurityHub(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"FailedCount":0,"SuccessCount":%d,"FailedFindings":[]}`, len(input.Findings))
+}
+
+func (f *FakeAWS) serveGetFindings(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		f.t.Errorf("FakeAWS: read body: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var input securityhub.GetFindingsInput
+	if err := json.Unmarshal(body, &input); err != nil {
+		f.t.Errorf("FakeAWS: decode GetFindings input: %v\nbody=%s", err, body)
+		f.writeJSONError(w, http.StatusBadRequest, "InvalidInputException", err.Error())
+		return
+	}
+
+	f.mu.Lock()
+	f.getFindings = append(f.getFindings, input)
+	f.mu.Unlock()
+
+	if f.GetFindingsError != nil {
+		f.writeJSONError(w, f.GetFindingsError.StatusCode, f.GetFindingsError.Type, f.GetFindingsError.Message)
+		return
+	}
+
+	out := struct {
+		Findings  []types.AwsSecurityFinding `json:"Findings"`
+		NextToken *string                    `json:"NextToken,omitempty"`
+	}{Findings: f.GetFindingsResults}
+	resp, err := json.Marshal(out)
+	if err != nil {
+		f.t.Errorf("FakeAWS: marshal GetFindings response: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(resp)
+}
+
+func (f *FakeAWS) serveBatchUpdate(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		f.t.Errorf("FakeAWS: read body: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var input securityhub.BatchUpdateFindingsInput
+	if err := json.Unmarshal(body, &input); err != nil {
+		f.t.Errorf("FakeAWS: decode BatchUpdateFindings input: %v\nbody=%s", err, body)
+		f.writeJSONError(w, http.StatusBadRequest, "InvalidInputException", err.Error())
+		return
+	}
+
+	f.mu.Lock()
+	f.batchUpdates = append(f.batchUpdates, input)
+	f.mu.Unlock()
+
+	if f.BatchUpdateError != nil {
+		f.writeJSONError(w, f.BatchUpdateError.StatusCode, f.BatchUpdateError.Type, f.BatchUpdateError.Message)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, `{"ProcessedFindings":[],"UnprocessedFindings":[]}`)
 }
 
 func (f *FakeAWS) serveSTS(w http.ResponseWriter, r *http.Request) {

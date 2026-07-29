@@ -44,11 +44,11 @@ func defaultCfg() Config {
 func newTestServer(t *testing.T, cfg Config) (*Server, *testutil.FakeAWS) {
 	t.Helper()
 	fake := testutil.NewFakeAWS(t)
-	srv, err := NewServer(context.Background(), fake.Config(), cfg)
+	clock := func() time.Time { return fixedNow }
+	srv, err := NewServer(context.Background(), fake.Config(), cfg, clock)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	srv.now = func() time.Time { return fixedNow }
 	return srv, fake
 }
 
@@ -699,6 +699,268 @@ func TestProcessTrivyWebhook_UnknownVerb(t *testing.T) {
 	}
 }
 
+// ---- Trivy ignore file: suppression-on-import ----
+
+func writeIgnoreFile(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "trivyignore.yaml")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("write ignore file: %v", err)
+	}
+	return p
+}
+
+func cfgWithIgnore(path string) Config {
+	c := defaultCfg()
+	c.IgnoreFile = path
+	return c
+}
+
+func TestVulnReport_IgnoreSuppressesMatchingCVE(t *testing.T) {
+	ignorePath := writeIgnoreFile(t, `vulnerabilities:
+  - id: CVE-2021-23017
+    statement: accepted risk per JIRA-123
+    expired_at: 2027-01-01
+`)
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	rr := postFixture(t, srv, "vulnerability_report_basic.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	findings := allFindings(fake.BatchImports())
+	if len(findings) == 0 {
+		t.Fatal("no findings imported")
+	}
+	var suppressed *types.AwsSecurityFinding
+	for i, f := range findings {
+		if f.Resources[0].Details.Other["CVE ID"] == "CVE-2021-23017" {
+			suppressed = &findings[i]
+			break
+		}
+	}
+	if suppressed == nil {
+		t.Fatal("CVE-2021-23017 not present in findings")
+	}
+	if suppressed.Workflow == nil || suppressed.Workflow.Status != types.WorkflowStatusSuppressed {
+		t.Errorf("Workflow.Status = %+v, want SUPPRESSED", suppressed.Workflow)
+	}
+	if suppressed.Note == nil {
+		t.Fatal("Note is nil; want suppression note")
+	}
+	noteText := aws.ToString(suppressed.Note.Text)
+	if !strings.Contains(noteText, "CVE-2021-23017") {
+		t.Errorf("Note.Text = %q, want it to mention rule id", noteText)
+	}
+	if !strings.Contains(noteText, "accepted risk per JIRA-123") {
+		t.Errorf("Note.Text = %q, want it to include statement", noteText)
+	}
+	if !strings.Contains(noteText, "2027") {
+		t.Errorf("Note.Text = %q, want it to include expiry year", noteText)
+	}
+	if got := suppressed.ProductFields["TrivyIgnoreRuleId"]; got != "CVE-2021-23017" {
+		t.Errorf("TrivyIgnoreRuleId marker = %q, want CVE-2021-23017", got)
+	}
+}
+
+func TestVulnReport_IgnoreNoMatchLeavesWorkflowUnset(t *testing.T) {
+	ignorePath := writeIgnoreFile(t, `vulnerabilities:
+  - id: CVE-9999-9999
+`)
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	rr := postFixture(t, srv, "vulnerability_report_basic.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	for i, f := range allFindings(fake.BatchImports()) {
+		if f.Workflow != nil {
+			t.Errorf("finding[%d] Workflow = %+v, want nil (no rule matches)", i, f.Workflow)
+		}
+		if _, ok := f.ProductFields["TrivyIgnoreRuleId"]; ok {
+			t.Errorf("finding[%d] should not carry the ignore marker", i)
+		}
+	}
+}
+
+func TestVulnReport_IgnoreExpiredEntryDoesNotMatch(t *testing.T) {
+	// fixedNow is 2026-04-30; expired_at 2026-01-01 is in the past.
+	ignorePath := writeIgnoreFile(t, `vulnerabilities:
+  - id: CVE-2021-23017
+    expired_at: 2026-01-01
+`)
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	rr := postFixture(t, srv, "vulnerability_report_basic.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	for _, f := range allFindings(fake.BatchImports()) {
+		if f.Workflow != nil {
+			t.Errorf("finding Workflow = %+v, want nil (rule expired and pruned)", f.Workflow)
+		}
+	}
+}
+
+func TestVulnReport_IgnorePathGlob(t *testing.T) {
+	ignorePath := writeIgnoreFile(t, `vulnerabilities:
+  - id: CVE-2024-MATCH
+    paths:
+      - "**/openssl*"
+  - id: CVE-2024-NOMATCH
+    paths:
+      - "etc/passwd"
+`)
+	body := vulnReportJSON(t, 2, func(i int, v map[string]any) {
+		switch i {
+		case 0:
+			v["vulnerabilityID"] = "CVE-2024-MATCH"
+			v["packagePath"] = "lib/x86_64/openssl.so.3"
+		case 1:
+			v["vulnerabilityID"] = "CVE-2024-NOMATCH"
+			v["packagePath"] = "lib/x86_64/openssl.so.3"
+		}
+	})
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	rr := postWebhook(t, srv, body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	findings := allFindings(fake.BatchImports())
+	if len(findings) != 2 {
+		t.Fatalf("got %d findings, want 2", len(findings))
+	}
+	byCVE := map[string]types.AwsSecurityFinding{}
+	for _, f := range findings {
+		byCVE[f.Resources[0].Details.Other["CVE ID"]] = f
+	}
+	if m := byCVE["CVE-2024-MATCH"]; m.Workflow == nil || m.Workflow.Status != types.WorkflowStatusSuppressed {
+		t.Errorf("CVE-2024-MATCH should be suppressed (path matches), got Workflow=%+v", m.Workflow)
+	}
+	if n := byCVE["CVE-2024-NOMATCH"]; n.Workflow != nil {
+		t.Errorf("CVE-2024-NOMATCH should not be suppressed (path mismatch), got Workflow=%+v", n.Workflow)
+	}
+}
+
+func TestVulnReport_NoIgnoreFile(t *testing.T) {
+	srv, fake := newTestServer(t, defaultCfg())
+	rr := postFixture(t, srv, "vulnerability_report_basic.json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", rr.Code, rr.Body.String())
+	}
+	for i, f := range allFindings(fake.BatchImports()) {
+		if f.Workflow != nil {
+			t.Errorf("finding[%d] Workflow = %+v, want nil (no ignore file configured)", i, f.Workflow)
+		}
+	}
+}
+
+// ---- Reconciler ----
+
+func suppressedFinding(id, cveID, target, pkgPath, ruleID string) types.AwsSecurityFinding {
+	return types.AwsSecurityFinding{
+		Id:         aws.String(id),
+		ProductArn: aws.String(testProductArn),
+		Workflow:   &types.Workflow{Status: types.WorkflowStatusSuppressed},
+		ProductFields: map[string]string{
+			"Product Name":      "Trivy",
+			"TrivyIgnoreRuleId": ruleID,
+		},
+		Resources: []types.Resource{{
+			Type: aws.String("Container"),
+			Id:   aws.String("docker.io/library/x"),
+			Details: &types.ResourceDetails{
+				Other: map[string]string{
+					"CVE ID":      cveID,
+					"Vuln Target": target,
+					"Pkg Path":    pkgPath,
+				},
+			},
+		}},
+		RecordState: types.RecordStateActive,
+	}
+}
+
+func TestReconciler_UnsuppresesExpiredOrRemoved(t *testing.T) {
+	ignorePath := writeIgnoreFile(t, `vulnerabilities:
+  - id: CVE-STILL-IGNORED
+`)
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	fake.GetFindingsResults = []types.AwsSecurityFinding{
+		suppressedFinding("finding-keep", "CVE-STILL-IGNORED", "", "", "CVE-STILL-IGNORED"),
+		suppressedFinding("finding-lift", "CVE-RULE-GONE", "", "", "CVE-RULE-GONE"),
+	}
+
+	srv.reconcileOnce(context.Background())
+
+	updates := fake.BatchUpdates()
+	if len(updates) != 1 {
+		t.Fatalf("BatchUpdateFindings calls = %d, want 1", len(updates))
+	}
+	idents := updates[0].FindingIdentifiers
+	if len(idents) != 1 {
+		t.Fatalf("FindingIdentifiers = %d, want 1", len(idents))
+	}
+	if got := aws.ToString(idents[0].Id); got != "finding-lift" {
+		t.Errorf("un-suppressed Id = %q, want finding-lift", got)
+	}
+	if updates[0].Workflow == nil || updates[0].Workflow.Status != types.WorkflowStatusNew {
+		t.Errorf("Workflow update = %+v, want NEW", updates[0].Workflow)
+	}
+}
+
+func TestReconciler_LeavesUntaggedSuppressionsAlone(t *testing.T) {
+	ignorePath := writeIgnoreFile(t, "vulnerabilities: []\n")
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	// SUPPRESSED finding without our marker — operator suppressed it manually
+	// in the console. The reconciler must not touch it.
+	consoleSuppressed := types.AwsSecurityFinding{
+		Id:         aws.String("console-suppressed"),
+		ProductArn: aws.String(testProductArn),
+		Workflow:   &types.Workflow{Status: types.WorkflowStatusSuppressed},
+		ProductFields: map[string]string{
+			"Product Name": "Trivy",
+		},
+		Resources: []types.Resource{{
+			Type: aws.String("Container"),
+			Details: &types.ResourceDetails{
+				Other: map[string]string{"CVE ID": "CVE-WHATEVER"},
+			},
+		}},
+	}
+	fake.GetFindingsResults = []types.AwsSecurityFinding{consoleSuppressed}
+
+	srv.reconcileOnce(context.Background())
+
+	if n := len(fake.BatchUpdates()); n != 0 {
+		t.Errorf("BatchUpdateFindings calls = %d, want 0 (manual suppression must not be touched)", n)
+	}
+}
+
+func TestReconciler_ContinuesAfterTickError(t *testing.T) {
+	ignorePath := writeIgnoreFile(t, "vulnerabilities: []\n")
+	srv, fake := newTestServer(t, cfgWithIgnore(ignorePath))
+	fake.GetFindingsError = &testutil.AWSError{
+		StatusCode: http.StatusBadRequest,
+		Type:       "InvalidInputException",
+		Message:    "boom",
+	}
+
+	// First tick: reconciler hits the error and must not panic or exit.
+	srv.reconcileOnce(context.Background())
+	if n := len(fake.GetFindingsCalls()); n == 0 {
+		t.Fatalf("GetFindings never called")
+	}
+
+	// Clear the error and run a second tick — it should succeed. This
+	// proves the reconciler is reusable after an error.
+	fake.GetFindingsError = nil
+	srv.reconcileOnce(context.Background())
+	if n := len(fake.GetFindingsCalls()); n < 2 {
+		t.Errorf("GetFindings calls after second tick = %d, want >= 2", n)
+	}
+	if n := len(fake.BatchUpdates()); n != 0 {
+		t.Errorf("BatchUpdates = %d, want 0 (no findings to update)", n)
+	}
+}
+
 func TestNewServer_STSFailureReturnsError(t *testing.T) {
 	fake := testutil.NewFakeAWS(t)
 	fake.STSError = &testutil.AWSError{
@@ -706,7 +968,7 @@ func TestNewServer_STSFailureReturnsError(t *testing.T) {
 		Type:       "AccessDenied",
 		Message:    "denied",
 	}
-	_, err := NewServer(context.Background(), fake.Config(), defaultCfg())
+	_, err := NewServer(context.Background(), fake.Config(), defaultCfg(), nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

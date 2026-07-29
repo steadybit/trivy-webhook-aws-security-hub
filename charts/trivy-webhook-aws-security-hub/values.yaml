@@ -33,12 +33,16 @@ fullnameOverride: ""
 ## @description config.CONFIG_AUDIT_ENABLE: Enable configuration audit.
 ## @description config.CLUSTER_COMPLIANCE_ENABLE: Enable cluster compliance.
 ## @description config.VULNERABILITY_ENABLE: Enable vulnerability assessment.
+## @description config.TRIVY_IGNORE_FILE: Path to a trivy YAML ignore file. Empty disables suppression.
+## @description config.IGNORE_RECONCILE_INTERVAL: How often to lift suppressions whose ignore rule expired or was removed. 0 disables the reconciler.
 config:
   AWS_REGION: eu-central-1
   INFRA_ASSESSMENT_ENABLE: false
   CONFIG_AUDIT_ENABLE: false
   CLUSTER_COMPLIANCE_ENABLE: false
   VULNERABILITY_ENABLE: true
+  TRIVY_IGNORE_FILE: ""
+  IGNORE_RECONCILE_INTERVAL: 24h
 
 ## @param extraenvs [array] Extra environment variables to set for the trivy-webhook container.
 ## @description Extra environment variables to set for the trivy-webhook container.

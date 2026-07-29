@@ -30,7 +30,7 @@ CI runs `go test` via `.github/workflows/test.yml`, which gates the Docker build
 
 ## Architecture
 
-This is a single-process HTTP webhook receiver that translates trivy-operator CRD reports into AWS Security Hub findings. The full request flow lives in `main.go`; `tools/main.go` only holds two small helpers (`GetVulnScore`, `ParseEnvBool`).
+This is a single-process HTTP webhook receiver that translates trivy-operator CRD reports into AWS Security Hub findings. The full request flow lives in `main.go`; the optional ignore-file suppression engine lives in `internal/ignore` with a periodic reconciler in `reconciler.go`. `tools/main.go` holds env-parsing helpers (`ParseEnvBool`, `ParseEnvDuration`, `GetVulnScore`).
 
 **Request flow** (`ProcessTrivyWebhook` in `main.go`):
 1. Trivy-operator POSTs a CRD object as JSON to `/trivy-webhook`. Two body shapes are accepted: raw report bodies, or the `WebhookMsg` envelope `{"verb":"update|delete","operatorObject":{...}}` that trivy-operator emits when `OPERATOR_SEND_DELETED_REPORTS=true`. Verb defaults to `update` when no envelope is present; unknown verbs return 200 OK with no work done (forward-compatible no-op).
@@ -50,6 +50,13 @@ When extending the stubs, mirror the structure of `getVulnerabilityReportFinding
 **AWS auth**: Uses the default AWS SDK credential chain (`config.LoadDefaultConfig`). In-cluster the chart expects IRSA — the user attaches a role via `serviceAccount.annotations`. Region comes from `AWS_REGION` (set in the chart's `config` block).
 
 **Product subscription**: The `ProductArn` points to Aqua Security's product entry in Security Hub. The receiving AWS account must accept the "Aqua Security: Aqua Security" product subscription in Security Hub for `BatchImportFindings` to succeed — this is the most common cause of silent failures in production.
+
+**Trivy ignore-file suppression** (`internal/ignore` package, optional, gated by `TRIVY_IGNORE_FILE`):
+- At startup `NewServer` calls `ignore.LoadIgnoreFile(path, now)` once. The schema mirrors the vulnerabilities-only subset of trivy's `.trivyignore.yaml`. PURL matching, the misconfig/secrets/licenses sections, and the legacy plain-text format are intentionally omitted.
+- In `getVulnerabilityReportFindings`, every CVE is run through `ignore.MatchVulnerability(vulnID, target, pkgPath)`. On match the finding is emitted with `Workflow.Status=SUPPRESSED`, a `Note` containing the rule's statement and expiry, and a `ProductFields["TrivyIgnoreRuleId"]` marker (the constant `trivyIgnoreRuleIDKey` in `main.go`). On no-match the `Workflow` field is left **unset** so existing operator triage state (`NOTIFIED`, `RESOLVED`) is preserved across re-imports.
+- `reconciler.go` runs a goroutine (`runReconciler`) that lifts stale suppressions when the underlying ignore rule expired or was removed. It eagerly executes one pass on startup, then ticks at `IGNORE_RECONCILE_INTERVAL` (default `24h`). It paginates `GetFindings` filtered by `ProductArn`/`WorkflowStatus=SUPPRESSED`/`RecordState=ACTIVE`, post-filters in Go on the marker (Security Hub's `MapFilter` has no "key exists" predicate), re-evaluates each against the current ignore file, and `BatchUpdateFindings`'s any non-matches back to `Workflow.Status=NEW`.
+- The reconciler uses a separate `securityhub.Client` built with `retry.NewAdaptiveMode` and `MaxAttempts=10`. The webhook request path keeps the SDK default retryer because user-facing latency matters there.
+- Reconciler errors are logged and swallowed — never `return err` from inside the loop. Only `ctx.Done()` exits the goroutine.
 
 ## Module path note
 

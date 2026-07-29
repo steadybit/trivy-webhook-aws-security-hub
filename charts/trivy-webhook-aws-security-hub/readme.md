@@ -166,6 +166,27 @@ By default, when the Trivy Operator removes a report (the underlying workload is
 
 The webhook then re-imports the same finding Ids with `RecordState=ARCHIVED`. Create/update events continue to import as `ACTIVE`.
 
+### Suppressing findings via a trivy ignore file
+
+Mount a [trivy YAML ignore file](https://trivy.dev/latest/docs/configuration/filtering/#trivyignoreyaml) (vulnerabilities-only subset is supported) and point the webhook at it via `config.TRIVY_IGNORE_FILE`. Matching findings are imported as `Workflow.Status=SUPPRESSED` with a note carrying the rule's statement and expiry. A reconciler controlled by `config.IGNORE_RECONCILE_INTERVAL` (default `24h`, set to `0` to disable) periodically lifts suppressions whose rule expired or was removed from the file.
+
+Mount the file from a ConfigMap using the chart's `volumes` / `volumeMounts` values:
+
+```yaml
+config:
+  TRIVY_IGNORE_FILE: /etc/trivy/.trivyignore.yaml
+  IGNORE_RECONCILE_INTERVAL: 24h
+
+volumes:
+  - name: trivy-ignore
+    configMap:
+      name: trivy-ignore
+volumeMounts:
+  - name: trivy-ignore
+    mountPath: /etc/trivy
+    readOnly: true
+```
+
 ## How It Works
 
 1. **Trivy Scan**: Trivy scans container images for vulnerabilities.

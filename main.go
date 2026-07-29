@@ -9,17 +9,35 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aquasecurity/trivy-operator/pkg/apis/aquasecurity/v1alpha1"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/securityhub"
 	"github.com/aws/aws-sdk-go-v2/service/securityhub/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/csepulveda/trivy-webhook-aws-security-hub/internal/ignore"
 	"github.com/csepulveda/trivy-webhook-aws-security-hub/tools"
 	"github.com/gorilla/mux"
+)
+
+// Finding-shape constants. The reconciler reads back what the import path
+// wrote, so the keys must agree on both sides — defining them once prevents
+// drift. trivyIgnoreRuleIDKey is the ProductFields marker that scopes the
+// reconciler to findings *we* suppressed (not operator-driven console ones).
+const (
+	productNameKey       = "Product Name"
+	trivyProductName     = "Trivy"
+	trivyIgnoreRuleIDKey = "TrivyIgnoreRuleId"
+	trivyWebhookUpdater  = "trivy-webhook"
+	cveIDKey             = "CVE ID"
+	vulnTargetKey        = "Vuln Target"
+	pkgPathKey           = "Pkg Path"
 )
 
 type webhook struct {
@@ -47,6 +65,8 @@ type Config struct {
 	ConfigAuditEnable       bool
 	ClusterComplianceEnable bool
 	VulnerabilityEnable     bool
+	IgnoreFile              string
+	ReconcileInterval       time.Duration
 }
 
 func LoadConfig() Config {
@@ -55,6 +75,8 @@ func LoadConfig() Config {
 		ConfigAuditEnable:       tools.ParseEnvBool("CONFIG_AUDIT_ENABLE", true),
 		ClusterComplianceEnable: tools.ParseEnvBool("CLUSTER_COMPLIANCE_ENABLE", true),
 		VulnerabilityEnable:     tools.ParseEnvBool("VULNERABILITY_ENABLE", true),
+		IgnoreFile:              os.Getenv("TRIVY_IGNORE_FILE"),
+		ReconcileInterval:       tools.ParseEnvDuration("IGNORE_RECONCILE_INTERVAL", 24*time.Hour),
 	}
 }
 
@@ -70,15 +92,15 @@ func remapSeverity(severity v1alpha1.Severity) string {
 	return string(severity)
 }
 
-// Security Hub caps Description at 1024 chars.
-func truncateDescription(description string) string {
-	if len(description) > 1024 {
-		return description[:1021] + "..."
+// truncate caps a string at max chars, replacing the tail with "..." when
+// it overflows. Used for Security Hub's per-field length limits (Description
+// is 1024, Note.Text is 512).
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	return description
+	return s[:max-3] + "..."
 }
-
-var trivyProductFields = map[string]string{"Product Name": "Trivy"}
 
 // errInvalidReport signals that the incoming report cannot be processed because
 // of missing identifying data. The dispatcher maps this to HTTP 400.
@@ -102,29 +124,53 @@ func resolveConfigAuditTarget(report *v1alpha1.ConfigAuditReport) (string, error
 
 // Server holds AWS clients and request-independent identity resolved once at startup.
 type Server struct {
-	cfg         Config
-	securityHub *securityhub.Client
-	accountID   string
-	region      string
-	productArn  string
-	now         func() time.Time
+	cfg                   Config
+	securityHub           *securityhub.Client
+	reconcilerSecurityHub *securityhub.Client
+	accountID             string
+	region                string
+	productArn            string
+	now                   func() time.Time
+	ignore                *ignore.IgnoreConfig
 }
 
-// NewServer resolves the caller identity via STS and constructs the Security Hub client.
-func NewServer(ctx context.Context, awsCfg aws.Config, cfg Config) (*Server, error) {
+// NewServer resolves the caller identity via STS and constructs the Security Hub clients.
+// A second SecurityHub client is built for the reconciler with adaptive
+// rate-limiting and a higher retry budget — that's a background job with no
+// latency budget, unlike the request path. If now is nil it defaults to
+// time.Now; tests inject a fixed clock for deterministic expiry pruning.
+func NewServer(ctx context.Context, awsCfg aws.Config, cfg Config, now func() time.Time) (*Server, error) {
+	if now == nil {
+		now = time.Now
+	}
 	stsClient := sts.NewFromConfig(awsCfg)
 	callerIdentity, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get caller identity: %w", err)
 	}
 	region := awsCfg.Region
+	ignoreCfg, err := ignore.LoadIgnoreFile(cfg.IgnoreFile, now())
+	if err != nil {
+		return nil, fmt.Errorf("loading ignore file: %w", err)
+	}
+	if cfg.IgnoreFile != "" {
+		log.Printf("Loaded %d active rule(s) from %s", len(ignoreCfg.Vulnerabilities), cfg.IgnoreFile)
+	}
 	return &Server{
 		cfg:         cfg,
 		securityHub: securityhub.NewFromConfig(awsCfg),
-		accountID:   aws.ToString(callerIdentity.Account),
-		region:      region,
-		productArn:  fmt.Sprintf("arn:aws:securityhub:%s::product/aquasecurity/aquasecurity", region),
-		now:         time.Now,
+		reconcilerSecurityHub: securityhub.NewFromConfig(awsCfg, func(o *securityhub.Options) {
+			o.Retryer = retry.NewAdaptiveMode(func(ao *retry.AdaptiveModeOptions) {
+				ao.StandardOptions = append(ao.StandardOptions, func(so *retry.StandardOptions) {
+					so.MaxAttempts = 10
+				})
+			})
+		}),
+		accountID:  aws.ToString(callerIdentity.Account),
+		region:     region,
+		productArn: fmt.Sprintf("arn:aws:securityhub:%s::product/aquasecurity/aquasecurity", region),
+		now:        now,
+		ignore:     ignoreCfg,
 	}, nil
 }
 
@@ -277,7 +323,7 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 
 	for _, check := range configAuditReport.Report.Checks {
 		severity := remapSeverity(check.Severity)
-		description := truncateDescription(check.Description)
+		description := truncate(check.Description, 1024)
 
 		other := map[string]string{}
 		if len(check.Messages) > 0 {
@@ -301,7 +347,7 @@ func (s *Server) getConfigAuditReportFindings(body []byte) ([]types.AwsSecurityF
 					Text: aws.String(check.Remediation),
 				},
 			},
-			ProductFields: trivyProductFields,
+			ProductFields: map[string]string{productNameKey: trivyProductName},
 			Resources: []types.Resource{
 				{
 					Type:      aws.String("Other"),
@@ -391,7 +437,20 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 		if description == "" {
 			description = vulnerabilities.Title
 		}
-		description = truncateDescription(description)
+		description = truncate(description, 1024)
+
+		productFields := map[string]string{productNameKey: trivyProductName}
+		var workflow *types.Workflow
+		var note *types.Note
+		if match := s.ignore.MatchVulnerability(vulnerabilities.VulnerabilityID, vulnerabilities.Target, vulnerabilities.PkgPath); match != nil {
+			workflow = &types.Workflow{Status: types.WorkflowStatusSuppressed}
+			note = &types.Note{
+				Text:      aws.String(buildSuppressionNote(match)),
+				UpdatedBy: aws.String(trivyWebhookUpdater),
+				UpdatedAt: aws.String(now),
+			}
+			productFields[trivyIgnoreRuleIDKey] = match.ID
+		}
 
 		findings = append(findings, types.AwsSecurityFinding{
 			SchemaVersion: aws.String("2018-10-08"),
@@ -411,7 +470,7 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 					Url:  aws.String(vulnerabilities.PrimaryLink),
 				},
 			},
-			ProductFields: trivyProductFields,
+			ProductFields: productFields,
 			Resources: []types.Resource{
 				{
 					Type:      aws.String("Container"),
@@ -421,22 +480,40 @@ func (s *Server) getVulnerabilityReportFindings(body []byte) ([]types.AwsSecurit
 					Details: &types.ResourceDetails{
 						Other: map[string]string{
 							"Container Image":   ImageName,
-							"CVE ID":            vulnerabilities.VulnerabilityID,
+							cveIDKey:            vulnerabilities.VulnerabilityID,
 							"CVE Title":         vulnerabilities.Title,
 							"PkgName":           vulnerabilities.Resource,
 							"Installed Package": vulnerabilities.InstalledVersion,
 							"Patched Package":   vulnerabilities.FixedVersion,
 							"NvdCvssScoreV3":    fmt.Sprintf("%f", tools.GetVulnScore(vulnerabilities)),
 							"NvdCvssVectorV3":   "",
+							vulnTargetKey:       vulnerabilities.Target,
+							pkgPathKey:          vulnerabilities.PkgPath,
 						},
 					},
 				},
 			},
 			RecordState: types.RecordStateActive,
+			Workflow:    workflow,
+			Note:        note,
 		})
 	}
 
 	return findings, nil
+}
+
+// buildSuppressionNote renders the trivy ignore rule into a human-readable
+// note for the Security Hub finding. Capped at 512 chars (Security Hub limit).
+func buildSuppressionNote(rule *ignore.IgnoreFinding) string {
+	stmt := rule.Statement
+	if stmt == "" {
+		stmt = "(no statement)"
+	}
+	expires := "never"
+	if !rule.ExpiredAt.IsZero() {
+		expires = rule.ExpiredAt.Format(time.RFC3339)
+	}
+	return truncate(fmt.Sprintf("Suppressed by trivy ignore rule %s. Statement: %s. Expires: %s", rule.ID, stmt, expires), 512)
 }
 
 // Import findings to AWS Security Hub in batches of 100
@@ -477,12 +554,32 @@ func main() {
 		log.Fatalf("unable to load AWS SDK config: %v", err)
 	}
 
-	srv, err := NewServer(startupCtx, awsCfg, cfg)
+	srv, err := NewServer(startupCtx, awsCfg, cfg, time.Now)
 	if err != nil {
 		log.Fatalf("unable to create server: %v", err)
 	}
 
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if cfg.IgnoreFile != "" && cfg.ReconcileInterval > 0 {
+		go srv.runReconciler(rootCtx)
+	} else if cfg.IgnoreFile != "" {
+		log.Printf("Ignore file configured but reconciler disabled (IGNORE_RECONCILE_INTERVAL=0); stale suppressions will not be lifted automatically")
+	}
+
 	port := ":8080"
 	log.Printf("Starting server on port %s", port)
-	log.Fatal(http.ListenAndServe(port, srv.Routes()))
+	httpSrv := &http.Server{Addr: port, Handler: srv.Routes()}
+	go func() {
+		<-rootCtx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP shutdown: %v", err)
+		}
+	}()
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }
